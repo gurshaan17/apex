@@ -2,11 +2,13 @@
 
 ## Current Phase
 
-**V1 - Step 3: FIFO Queue + Price Level**
+**V1 - Steps 5–7: Limit Matching, Partial Fills & Cancellation**
 
-The repository foundation, the order domain model (`internal/order`), and the
-FIFO queue + price level data structures (`internal/book`) are in place. No
-order book or matching functionality has been implemented.
+The order domain model (`internal/order`), the FIFO queue + price level data
+structures, the order book (`internal/book`), and a matching engine
+(`internal/engine`) are all in place. The engine matches limit orders with
+price-time priority, generates trades at the resting order's price, handles
+partial fills, and supports cancellation.
 
 ---
 
@@ -51,7 +53,8 @@ Clearing   Market Data
 apex/
 ├── cmd/matching-engine/   — Application entry point
 ├── internal/order/        — Order domain model (implemented)
-├── internal/book/         — FIFO queue + price level (implemented)
+├── internal/book/         — FIFO queue, price level, order book (implemented)
+├── internal/engine/       — Matching engine: submit, cancel, trades (implemented)
 ├── internal/              — Further domain packages (future)
 ├── docs/                  — Architecture and design documents
 ├── tests/                 — Integration and end-to-end tests (future)

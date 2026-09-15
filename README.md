@@ -11,14 +11,13 @@ distribution.
 
 ## Current Status
 
-**V1 - Step 3: FIFO Queue + Price Level**
+**V1 - Steps 5–7: Limit Matching, Partial Fills & Cancellation**
 
-This step adds the core data structures that underpin the future order book:
-an O(1)-amortised FIFO order queue backed by a doubly linked list, and a
-`PriceLevel` abstraction that groups all orders resting at a single price.
-All operations maintain strict time priority; cancellation of a specific order
-is O(1) via a node reference (see below). Matching functionality has **not**
-been implemented yet.
+The first fully functional matching engine is now in place. Limit orders match
+with price-time priority, trades execute at the resting order's price, partial
+fills update quantities and status on both sides, and resting orders can be
+cancelled. Market orders, transport, concurrency, persistence, risk, clearing,
+and market data remain future phases.
 
 ## Order Structure
 
@@ -173,22 +172,91 @@ at any positive price level.
 Full complexity analysis and design rationale are in
 [docs/data-structures.md](docs/data-structures.md).
 
-## Planned V1 Phases
+## Order Book
 
-| #  | Phase                        |
-|----|------------------------------|
-| 01 | Project Foundation           |
-| 02 | Order Domain                 |
-| 03 | FIFO Queue + Price Level     |
-| 04 | Order Book                   |
-| 05 | Limit Matching               |
-| 06 | Partial Fills                |
-| 07 | Cancellation                 |
-| 08 | Market Orders                |
-| 09 | Engine API                   |
-| 10 | Invariants + Determinism     |
-| 11 | Benchmarks                   |
-| 12 | Profiling + Optimization     |
+The order book (`internal/book`) maintains resting orders across multiple
+price levels with **price-time priority**: bids sorted by price descending,
+asks ascending, FIFO within each price.
+
+```
+                    ORDER BOOK
+
+ BUY / BIDS                  SELL / ASKS
+
+ 105 → A → B                106 → X
+ 104 → C                    107 → Y → Z
+ 103 → D → E                108 → W
+
+ best bid = 105              best ask = 106
+```
+
+Key points:
+
+- **Best bid/ask** — O(1) via the front of each side's sorted price list.
+- **Order lookup/removal** — an `OrderID → {side, price, node}` index makes
+  `Get`, `Remove`, and future cancellation O(1) without scanning.
+- **Empty levels removed** — when the last order at a price is removed, the
+  price level disappears, so best prices always reflect populated levels.
+- **Snapshot** — `Snapshot()` returns a read-only, best-first view with price,
+  total quantity, and FIFO orders per level; snapshot orders are copies.
+- **Market orders rejected** — a market order has no resting price; execution
+  is a later phase.
+- **Crossed books allowed** — matching is a later phase (Step 5).
+
+Full details: [docs/order-book.md](docs/order-book.md).
+
+## Matching Engine
+
+The matching engine (`internal/engine`) is everything between an order's
+inbox and its resting (or terminal) state. It owns an order book and a
+registry of every submitted order.
+
+```go
+e := engine.NewEngine()
+
+res, err := e.SubmitOrder(limitOrder) // order.Order by value
+//  res: SubmitResult{ OrderID, OriginalQty, FilledQty, Remaining, Status, Trades }
+
+err := e.CancelOrder(orderID)         // typed error for filled / cancelled / unknown
+o,  err := e.GetOrder(orderID)        // live view of a submitted order
+snap   := e.GetOrderBookSnapshot()    // read-only book view
+```
+
+Behavior:
+
+- **Price-time priority** — against the best opposite price, oldest order
+  first (FIFO within each price level).
+- **Trade price = resting order's price** — the maker always sets the price.
+- **Partial fills** — a residual on the aggressor rests in the book with its
+  original arrival time; a partially filled resting order keeps its queue
+  position.
+- **Multiple levels** — an aggressive order walks price levels best-first
+  until filled.
+- **Deterministic** — trade IDs are a monotonic counter, trades are emitted in
+  execution order, no map iteration influences priority; `Trade.Timestamp` is
+  the incoming order's time, so identical input replays identically.
+- **Errors** — typed sentinels: `ErrUnsupportedOrderType`,
+  `ErrOrderNotFound`, `ErrAlreadyFilled`, `ErrAlreadyCancelled`,
+  `ErrDuplicateOrder`.
+
+Full details: [docs/matching-engine.md](docs/matching-engine.md).
+
+## V1 Progress
+
+| #  | Phase                    | Status                     |
+|----|--------------------------|----------------------------|
+| 01 | Project Foundation       | ✓ Done (Step 1)            |
+| 02 | Order Domain             | ✓ Done (Step 2)            |
+| 03 | FIFO Queue + Price Level | ✓ Done (Step 3)            |
+| 04 | Order Book               | ✓ Done (Step 4)            |
+| 05 | Limit Matching           | ✓ Done (Step 5)            |
+| 06 | Partial Fills            | ✓ Done (Step 6)            |
+| 07 | Cancellation             | ✓ Done (Step 7)            |
+| 08 | Market Orders            | Planned                    |
+| 09 | Engine API               | Planned                    |
+| 10 | Invariants + Determinism | Planned                    |
+| 11 | Benchmarks               | Planned                    |
+| 12 | Profiling + Optimization | Planned                    |
 
 ## Development Commands
 
