@@ -2,10 +2,11 @@
 
 ## Current Phase
 
-**V1 - Step 1: Project Foundation**
+**V1 - Step 2: Order Domain**
 
-This phase establishes the project structure, build tooling, and documentation.
-No matching-engine functionality has been implemented.
+The repository foundation (Step 1) and the order domain model
+(`internal/order`) are in place. Order types, validation, and lifecycle are
+implemented. No matching-engine functionality has been implemented.
 
 ---
 
@@ -49,7 +50,8 @@ Clearing   Market Data
 ```
 apex/
 ├── cmd/matching-engine/   — Application entry point
-├── internal/              — Domain packages (future)
+├── internal/order/        — Order domain model (implemented)
+├── internal/              — Further domain packages (future)
 ├── docs/                  — Architecture and design documents
 ├── tests/                 — Integration and end-to-end tests (future)
 ├── go.mod
