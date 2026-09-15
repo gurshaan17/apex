@@ -2,11 +2,11 @@
 
 ## Current Phase
 
-**V1 - Step 2: Order Domain**
+**V1 - Step 3: FIFO Queue + Price Level**
 
-The repository foundation (Step 1) and the order domain model
-(`internal/order`) are in place. Order types, validation, and lifecycle are
-implemented. No matching-engine functionality has been implemented.
+The repository foundation, the order domain model (`internal/order`), and the
+FIFO queue + price level data structures (`internal/book`) are in place. No
+order book or matching functionality has been implemented.
 
 ---
 
@@ -51,6 +51,7 @@ Clearing   Market Data
 apex/
 ├── cmd/matching-engine/   — Application entry point
 ├── internal/order/        — Order domain model (implemented)
+├── internal/book/         — FIFO queue + price level (implemented)
 ├── internal/              — Further domain packages (future)
 ├── docs/                  — Architecture and design documents
 ├── tests/                 — Integration and end-to-end tests (future)

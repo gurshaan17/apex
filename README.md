@@ -11,11 +11,14 @@ distribution.
 
 ## Current Status
 
-**V1 - Step 2: Order Domain**
+**V1 - Step 3: FIFO Queue + Price Level**
 
-This step introduces the foundational order domain model: orders, order sides,
-order types, order statuses, validation, and the order lifecycle. Matching
-functionality has **not** been implemented yet.
+This step adds the core data structures that underpin the future order book:
+an O(1)-amortised FIFO order queue backed by a doubly linked list, and a
+`PriceLevel` abstraction that groups all orders resting at a single price.
+All operations maintain strict time priority; cancellation of a specific order
+is O(1) via a node reference (see below). Matching functionality has **not**
+been implemented yet.
 
 ## Order Structure
 
@@ -118,6 +121,57 @@ unmodified. Applying a fill never uses floating-point arithmetic.
 | `IsFullyFilled()`     | Whether the order has been completely filled     |
 | `CanCancel()`         | Whether the order is in a cancellable state      |
 | `Cancel()`            | Transition `Open/PartiallyFilled → Cancelled`    |
+
+## FIFO Order Queue & Price Level
+
+### Why FIFO
+
+Price-time-priority matching requires that, at each price level, orders are
+served in the exact order they arrived. A sell order that can trade at ₹100
+must fill the first resting buy order at ₹100 before the second, regardless
+of quantity or any other attribute.
+
+### Data structure
+
+The queue is a **doubly linked list** (`internal/book`). A doubly linked
+list was chosen because:
+
+- Removing an order from the middle (cancellation) is O(1) when the caller
+  holds the `*Node` returned by `Push`.
+- Append (new order), peek (best order at a level), and pop (consume first
+  order) are all O(1).
+- The future order book can maintain an `OrderID → *Node` map, making
+  cancel-by-ID O(1) without scanning.
+
+### Operation complexity
+
+| Operation        | Complexity | Notes                                   |
+|------------------|------------|-----------------------------------------|
+| `Push`           | O(1)       | Append to tail; returns `*Node` handle  |
+| `Front` / `Peek` | O(1)      | Dereference head                        |
+| `Pop`            | O(1)       | Unlink head                             |
+| `Remove(node)`   | O(1)       | Direct reference + owner check          |
+| `Len`            | O(1)       | Maintained counter                      |
+| `IsEmpty`        | O(1)       | `len == 0`                              |
+
+### PriceLevel
+
+A `PriceLevel` binds a price to an `OrderQueue`. All orders in the level
+must share exactly that price; adding an order with a different price is
+rejected with `ErrWrongPrice`. Market orders (price 0) are also rejected
+at any positive price level.
+
+### Invariants
+
+- `Len >= 0`; `Len == 0` iff `Head == nil` and `Tail == nil`.
+- `Head.prev == nil` and `Tail.next == nil` always.
+- Traversal from `Head` to `Tail` visits exactly `Len` distinct nodes: no
+  cycles, no orphans.
+- Every node in the queue is owned by that queue and carries a non-nil order.
+- In a `PriceLevel`, every order's price equals the level's price.
+
+Full complexity analysis and design rationale are in
+[docs/data-structures.md](docs/data-structures.md).
 
 ## Planned V1 Phases
 
