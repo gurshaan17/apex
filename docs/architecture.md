@@ -2,13 +2,14 @@
 
 ## Current Phase
 
-**V1 - Steps 5–7: Limit Matching, Partial Fills & Cancellation**
+**V1 - Steps 8–10: Market Orders, Engine API & Result Model, Determinism & Invariants**
 
 The order domain model (`internal/order`), the FIFO queue + price level data
-structures, the order book (`internal/book`), and a matching engine
-(`internal/engine`) are all in place. The engine matches limit orders with
-price-time priority, generates trades at the resting order's price, handles
-partial fills, and supports cancellation.
+structures and order book (`internal/book`), and a matching engine
+(`internal/engine`) are in place. The engine matches limit and market orders
+with price-time priority, generates trades at the resting order's price,
+handles partial fills and cancellation, exposes a small immutable-safe API,
+and is backed by invariant and determinism guarantees.
 
 ---
 

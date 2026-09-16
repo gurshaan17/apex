@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"fmt"
+
 	"github.com/gurshaan17/apex/internal/book"
 	"github.com/gurshaan17/apex/internal/order"
 )
@@ -23,15 +25,19 @@ func NewEngine() *Engine {
 }
 
 // SubmitOrder validates an order, matches it against the opposite side using
-// price-time priority, and rests any remaining quantity in the book. Every
-// trade is executed at the resting order's price. The caller's order is copied;
-// use GetOrder or the returned SubmitResult to observe the outcome.
+// price-time priority, and rests any limit-order residual in the book.
+//
+// Every trade is executed at the resting order's price.
+//
+// Market orders never rest: they consume the best available liquidity across
+// price levels until filled or until liquidity runs out, and any unfilled
+// remainder is cancelled.
+//
+// SubmitOrder copies the caller's order; use GetOrder or the returned
+// SubmitResult to observe the outcome.
 func (e *Engine) SubmitOrder(o order.Order) (SubmitResult, error) {
 	if err := o.Validate(); err != nil {
 		return SubmitResult{}, err
-	}
-	if o.Type != order.Limit {
-		return SubmitResult{}, ErrUnsupportedOrderType
 	}
 	if _, ok := e.orders[o.ID]; ok {
 		return SubmitResult{}, ErrDuplicateOrder
@@ -78,8 +84,17 @@ func (e *Engine) SubmitOrder(o order.Order) (SubmitResult, error) {
 	}
 
 	if p.Remaining() > 0 {
-		if err := e.book.Place(p); err != nil {
-			return SubmitResult{}, err
+		switch p.Type {
+		case order.Market:
+			// A market order cannot rest: insufficient liquidity means the
+			// unfilled remainder is cancelled, preserving filled quantity.
+			if err := p.Cancel(); err != nil {
+				return SubmitResult{}, err
+			}
+		default:
+			if err := e.book.Place(p); err != nil {
+				return SubmitResult{}, err
+			}
 		}
 	}
 
@@ -115,23 +130,100 @@ func (e *Engine) CancelOrder(id order.OrderID) error {
 	return o.Cancel()
 }
 
-// GetOrder returns the engine's live view of a submitted order. The returned
-// pointer is owned by the engine; mutating it bypasses engine invariants.
+// GetOrder returns a copy of a submitted order so callers can inspect status
+// and quantities without mutating engine-owned state.
 func (e *Engine) GetOrder(id order.OrderID) (*order.Order, error) {
 	o, ok := e.orders[id]
 	if !ok {
 		return nil, ErrOrderNotFound
 	}
-	return o, nil
+	cp := *o
+	return &cp, nil
 }
 
-// GetOrderBookSnapshot returns a read-only snapshot of the current book.
+// GetOrderBookSnapshot returns a read-only view of the current book. All
+// orders returned are copies; mutating the result never affects the engine.
 func (e *Engine) GetOrderBookSnapshot() book.Snapshot {
 	return e.book.Snapshot()
 }
 
+// CheckInvariants verifies the aggregate engine invariants: quantity
+// accounting for every submitted order, exact book occupancy by status, and
+// the book's own structural invariants. It is intended for diagnostics and
+// tests; production paths do not pay this cost.
+func (e *Engine) CheckInvariants() error {
+	if err := e.book.CheckInvariants(); err != nil {
+		return fmt.Errorf("book: %w", err)
+	}
+
+	inBook := make(map[order.OrderID]bool)
+	snap := e.book.Snapshot()
+	for _, lvl := range snap.Bids {
+		seen := make(map[order.OrderID]bool)
+		for _, o := range lvl.Orders {
+			if seen[o.ID] {
+				return fmt.Errorf("order %d appears twice in bid levels", o.ID)
+			}
+			seen[o.ID] = true
+			inBook[o.ID] = true
+			if o.Remaining() <= 0 {
+				return fmt.Errorf("resting order %d has non-positive remaining", o.ID)
+			}
+		}
+	}
+	for _, lvl := range snap.Asks {
+		seen := make(map[order.OrderID]bool)
+		for _, o := range lvl.Orders {
+			if seen[o.ID] {
+				return fmt.Errorf("order %d appears twice in ask levels", o.ID)
+			}
+			seen[o.ID] = true
+			inBook[o.ID] = true
+			if o.Remaining() <= 0 {
+				return fmt.Errorf("resting order %d has non-positive remaining", o.ID)
+			}
+		}
+	}
+
+	for id, o := range e.orders {
+		if o.ID != id {
+			return fmt.Errorf("registry key %d maps to order %d", id, o.ID)
+		}
+		if o.Qty <= 0 {
+			return fmt.Errorf("order %d has non-positive original qty", id)
+		}
+		if o.Filled < 0 {
+			return fmt.Errorf("order %d has negative filled qty", id)
+		}
+		if o.Remaining() < 0 {
+			return fmt.Errorf("order %d has negative remaining qty", id)
+		}
+		if o.Filled > o.Qty {
+			return fmt.Errorf("order %d filled %d exceeds original %d", id, o.Filled, o.Qty)
+		}
+		if o.Filled+o.Remaining() != o.Qty {
+			return fmt.Errorf("order %d accounting broken: filled %d + remaining %d != original %d", id, o.Filled, o.Remaining(), o.Qty)
+		}
+		switch o.Status {
+		case order.Open, order.PartiallyFilled:
+			if !inBook[id] {
+				return fmt.Errorf("active order %d (%s) not present in book", id, o.Status)
+			}
+		case order.Filled, order.Cancelled:
+			if inBook[id] {
+				return fmt.Errorf("terminal order %d (%s) still present in book", id, o.Status)
+			}
+		default:
+			return fmt.Errorf("order %d in unexpected status %s", id, o.Status)
+		}
+	}
+	return nil
+}
+
 // bestOpposite returns the highest-priority opposite-side order that the given
 // order can trade against, or ok=false if no executable liquidity exists.
+// Market orders cross regardless of price; limit orders only cross when their
+// price meets or beats the best opposite price.
 func (e *Engine) bestOpposite(o *order.Order) (*order.Order, bool) {
 	var price order.Price
 	var opposite order.Side
@@ -140,13 +232,19 @@ func (e *Engine) bestOpposite(o *order.Order) (*order.Order, bool) {
 	case order.Buy:
 		price = e.book.BestAsk()
 		opposite = order.Sell
-		if price == 0 || o.Price < price {
+		if price == 0 {
+			return nil, false
+		}
+		if o.Type != order.Market && o.Price < price {
 			return nil, false
 		}
 	case order.Sell:
 		price = e.book.BestBid()
 		opposite = order.Buy
-		if price == 0 || o.Price > price {
+		if price == 0 {
+			return nil, false
+		}
+		if o.Type != order.Market && o.Price > price {
 			return nil, false
 		}
 	default:

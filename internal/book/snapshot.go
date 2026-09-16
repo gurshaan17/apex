@@ -22,6 +22,13 @@ type Snapshot struct {
 	Asks []LevelSnapshot
 }
 
+// CheckInvariants verifies the structural invariants of the book. It is the
+// public entry point used by engine-level diagnostics; production paths do not
+// pay this cost.
+func (ob *OrderBook) CheckInvariants() error {
+	return ob.checkInvariants()
+}
+
 // checkInvariants verifies the structural invariants of the book. It is used
 // by tests; production paths do not pay this cost.
 func (ob *OrderBook) checkInvariants() error {

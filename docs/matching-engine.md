@@ -1,7 +1,7 @@
 # Matching Engine
 
-This document describes the matching engine implemented in Steps 5–7. It
-coordinates the order book from Step 4 to execute limit orders with
+This document describes the matching engine implemented in Steps 5–10. It
+coordinates the order book from Step 4 to execute limit and market orders with
 price-time priority, generate trades, handle partial fills, and support
 cancellation. It lives in [`internal/engine`](../internal/engine).
 
@@ -19,8 +19,8 @@ incoming│  SubmitOrder │─────────────▶│  Open 
         (best opposite order first)        │
                │                            │
                ▼                            ▼
-        trades generated at            any remaining qty rests
-        resting order's price          via book.Place
+        trades generated at            limit: residual rests
+        resting order's price          market: residual cancelled
                │                            │
                ▼                            ▼
         SubmitResult                    book snapshot
@@ -35,8 +35,10 @@ consistent; the engine does not enforce it.
 For each order, while the order has remaining quantity:
 
 1. **Crossing check.** A BUY matches when `buy price >= best ask`; a SELL
-   matches when `sell price <= best bid`. If the incoming order does not cross
-   the best opposite price (or the opposite side is empty), matching stops.
+   matches when `sell price <= best bid`. Market orders always cross: they
+   have no limit price, so the check is skipped. If the incoming order does
+   not cross the best opposite price (or the opposite side is empty),
+   matching stops.
 2. **Pick the resting order.** The engine takes the front order at the best
    opposite price (`book.FrontOrder`). Because each price level is a strict
    FIFO queue, this is the *oldest* order at the *best* price.
@@ -133,6 +135,90 @@ BUY 250 @ 102  → trades 50@100, 100@101, 100@102; SELL 100 @102 remains
 The book never contains a crossed state after a submit: any crossing quantity
 is consumed before the residual rests.
 
+## Market orders
+
+A `MARKET` order (price `0`, validated by the order domain) consumes available
+opposite-side liquidity starting at the best price and walking across levels
+until it is fully filled or liquidity runs out. All trades execute at the
+resting order's price.
+
+```
+ASKS
+100 → 50
+101 → 100
+102 → 200
+
+MARKET BUY 120  →  50 @ 100, 70 @ 101
+```
+
+Key rules:
+
+- **No resting.** A market order never enters the book. If it fills exactly,
+  its status is `FILLED`.
+- **Insufficient liquidity.** If the market order consumes every opposite-side
+  order and still has quantity left, the **unfilled remainder is cancelled**
+  (`CANCELLED`), preserving the filled quantity. This is deterministic and
+  documented; the market order never transitions to `PARTIALLY_FILLED` as a
+  resting state.
+- **Empty side.** A market order with no opposite liquidity fills nothing and
+  is cancelled (`CANCELLED`, filled `0`).
+- **No floats.** Both fill sizes and prices stay integers throughout.
+
+The available-liquidity behavior applies to both directions:
+
+```
+SELL 50 @ 100
+SELL 100 @ 101
+MARKET BUY 120  →  trades 50 @ 100, 70 @ 101; SELL 30 @ 101 remains
+
+BUY  50 @ 102
+BUY  100 @ 101
+MARKET SELL 120 →  trades 50 @ 102, 70 @ 101; BUY 30 @ 101 remains
+```
+
+## Public API & result model
+
+The public surface is intentionally small:
+
+| Operation            | Signature                                   | Notes                              |
+|----------------------|---------------------------------------------|------------------------------------|
+| `SubmitOrder`        | `(order.Order) (SubmitResult, error)`       | Order taken **by value**           |
+| `CancelOrder`        | `(order.OrderID) error`                     | Typed errors for bad targets       |
+| `GetOrderBookSnapshot` | `() book.Snapshot`                        | Read-only, orders are copies       |
+| `GetOrder`           | `(order.OrderID) (*order.Order, error)`     | Convenience; returns a **copy**    |
+| `CheckInvariants`    | `() error`                                  | Diagnostics (Step 10)              |
+
+Callers never receive internal structures: queues, nodes, the price-level
+maps, and the byID index are all unexported, and `SubmitOrder` copies the
+order at the boundary. `SubmitResult` reports everything a caller needs about
+one submission — order ID, final status, original/filled/remaining quantities,
+and the trades generated:
+
+```go
+type SubmitResult struct {
+    OrderID     order.OrderID
+    OriginalQty order.Quantity
+    FilledQty   order.Quantity
+    Remaining   order.Quantity
+    Status      order.Status
+    Trades      []Trade
+}
+
+type Trade struct {
+    TradeID     uint64
+    Symbol      string
+    BuyOrderID  order.OrderID
+    SellOrderID order.OrderID
+    Price       order.Price
+    Qty         order.Quantity
+    Timestamp   time.Time
+}
+```
+
+Errors are returned explicitly as typed sentinels matched with `errors.Is`. The
+API depends only on the `order`, `book`, and `time` packages — no networking,
+transport, or persistence types leak in.
+
 ## Order lifecycle
 
 Only these transitions can be produced by the engine (enforced by the order
@@ -143,8 +229,8 @@ domain):
 - `PARTIALLY_FILLED → PARTIALLY_FILLED / FILLED / CANCELLED`
 
 The engine owns every submitted `*order.Order` in a registry (`Engine.orders`)
-and hands the same pointer to the book, so the book, the registry, and `GetOrder`
-always agree on status and quantities.
+and hands the same pointer to the book internally. Externally, `GetOrder`
+returns a copy, so outside observers can only read state.
 
 ## Cancellation
 
@@ -169,16 +255,39 @@ BUY   40 @ 100   → SELL rest, PARTIAL 40/60
 CancelOrder(SELL) → CANCELLED, filled 40, remaining 60; book SELL side empty
 ```
 
-## Timestamps and determinism
+## Determinism
 
 - A resting order keeps the `Time` it was submitted with.
 - `Trade.Timestamp` is the **incoming order's `Time`**, not an engine-side
   wall clock. The engine performs **no** time mutation.
 
 Given identical input (same order values, including `Time`), the engine
-produces byte-identical output: trade IDs are a monotonic counter, trades are
-emitted in execution order, and no map iteration influences priority. A
-`TestDeterminism` test replays a scenario twice and compares full results.
+produces identical output: trade IDs are a monotonic counter, trades are
+emitted in execution order, and **no Go map iteration anywhere influences
+priority or matching** (books use linked-oriented price lists and FIFO queues;
+the registry is only used for O(1) lookup). Deterministic scenario tests replay
+a fixed sequence — including limits, markets, partial fills, and cancellations
+— twice and compare the full trade list, every order state, cancellation
+results, and the final book.
+
+## Invariants
+
+`Engine.CheckInvariants()` verifies, for every submitted order:
+
+- `filled + remaining == original quantity`
+- `filled <= original quantity`
+- `remaining >= 0`
+- resting orders have positive remaining
+- active orders (`OPEN`/`PARTIALLY_FILLED`) are present in the book exactly
+  once (and never duplicated across levels)
+- filled and cancelled orders are absent from the book
+- registry key ↔ order identity consistency
+
+It delegates book-structure checks (price priority ordering, FIFO queue
+integrity, byID index ↔ level agreement, no empty levels) to
+`book.CheckInvariants()`. Production paths never pay this cost; tests and
+diagnostics use it, including corruption-detection tests that break an
+invariant and assert the checker catches it.
 
 ## Data structures & complexity
 
@@ -223,8 +332,12 @@ memory.
   pointer, so every structure observing an order sees identical state with no
   copying. Ownership of all orders is the engine's.
 - **Value semantics at the boundary.** `SubmitOrder` takes an `order.Order` by
-  value, so callers cannot mutate a resting order by accident through their own
-  copy. The outcome is delivered through `SubmitResult` and `GetOrder`.
+  value, `GetOrder` returns a copy, and snapshots copy every order, so callers
+  cannot mutate resting state through their own handle. The engine pays the
+  copy cost at the API edge and keeps exclusive ownership inside.
+- **Market-order remainder → CANCELLED.** Instead of resting (impossible for
+  a price-less order) or silently dropping fills, an unfilled remainder is
+  explicitly cancelled so quantity accounting stays exact and observable.
 - **Explicit errors, not result structs.** The spec sketches
   `CancelOrder → CancelResult`; this Go implementation returns `error` (typed,
   comparable with `errors.Is`) instead, which is the idiomatic form.
@@ -236,6 +349,6 @@ memory.
 
 ## Out of scope (later phases)
 
-Market orders, order cancellation round-trips through a transport layer,
-locking/concurrency, persistence, trade/clearing, risk, and market-data
-publication are explicitly deferred.
+Order cancellation round-trips through a transport layer, locking/concurrency,
+persistence, trade/clearing, risk, and market-data publication are explicitly
+deferred.

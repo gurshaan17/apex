@@ -2,9 +2,12 @@ package engine
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/gurshaan17/apex/internal/book"
 	"github.com/gurshaan17/apex/internal/order"
 )
 
@@ -424,11 +427,161 @@ func TestCancelThenAddKeepsFIFO(t *testing.T) {
 	}
 }
 
-func TestMarketOrderRejected(t *testing.T) {
+func mkMarket(id order.OrderID, side order.Side, qty order.Quantity) order.Order {
+	return order.NewOrder(id, "AAPL", side, order.Market, 0, qty)
+}
+
+func TestMarketBuyAcrossMultipleLevels(t *testing.T) {
 	e := NewEngine()
-	mkt := order.NewOrder(1, "AAPL", order.Buy, order.Market, 0, 100)
-	if _, err := e.SubmitOrder(mkt); !errors.Is(err, ErrUnsupportedOrderType) {
-		t.Errorf("SubmitOrder(market) err = %v, want %v", err, ErrUnsupportedOrderType)
+	mustSubmit(t, e, mkLimit(1, order.Sell, 100, 50))
+	mustSubmit(t, e, mkLimit(2, order.Sell, 101, 100))
+	mustSubmit(t, e, mkLimit(3, order.Sell, 102, 200))
+
+	r := mustSubmit(t, e, mkMarket(4, order.Buy, 120))
+	if len(r.Trades) != 2 {
+		t.Fatalf("expected 2 trades, got %d", len(r.Trades))
+	}
+	assertTrade(t, r.Trades[0], 1, 4, 1, 100, 50)
+	assertTrade(t, r.Trades[1], 2, 4, 2, 101, 70)
+
+	if r.Status != order.Filled || r.FilledQty != 120 || r.Remaining != 0 {
+		t.Errorf("market buy = %s filled=%d remaining=%d, want FILLED 120/0", r.Status, r.FilledQty, r.Remaining)
+	}
+	if asks := e.GetOrderBookSnapshot().Asks; len(asks) != 2 || asks[0].Qty != 30 {
+		t.Errorf("asks should hold 30 @101 and 200 @102, got %+v", asks)
+	}
+}
+
+func TestMarketSellAcrossMultipleLevels(t *testing.T) {
+	e := NewEngine()
+	mustSubmit(t, e, mkLimit(1, order.Buy, 102, 50))
+	mustSubmit(t, e, mkLimit(2, order.Buy, 101, 100))
+	mustSubmit(t, e, mkLimit(3, order.Buy, 100, 200))
+
+	r := mustSubmit(t, e, mkMarket(4, order.Sell, 120))
+	if len(r.Trades) != 2 {
+		t.Fatalf("expected 2 trades, got %d", len(r.Trades))
+	}
+	assertTrade(t, r.Trades[0], 1, 1, 4, 102, 50)
+	assertTrade(t, r.Trades[1], 2, 2, 4, 101, 70)
+
+	if r.Status != order.Filled || r.FilledQty != 120 || r.Remaining != 0 {
+		t.Errorf("market sell = %s filled=%d remaining=%d, want FILLED 120/0", r.Status, r.FilledQty, r.Remaining)
+	}
+	if bids := e.GetOrderBookSnapshot().Bids; len(bids) != 2 || bids[0].Qty != 30 {
+		t.Errorf("bids should hold 30 @101 and 200 @100, got %+v", bids)
+	}
+}
+
+func TestMarketBuyExactFill(t *testing.T) {
+	e := NewEngine()
+	mustSubmit(t, e, mkLimit(1, order.Sell, 100, 100))
+	r := mustSubmit(t, e, mkMarket(2, order.Buy, 100))
+
+	if len(r.Trades) != 1 {
+		t.Fatalf("expected 1 trade, got %d", len(r.Trades))
+	}
+	assertTrade(t, r.Trades[0], 1, 2, 1, 100, 100)
+	if r.Status != order.Filled {
+		t.Errorf("market buy status = %s, want FILLED", r.Status)
+	}
+	if o := mustGet(t, e, 1); o.Status != order.Filled {
+		t.Errorf("resting sell status = %s, want FILLED", o.Status)
+	}
+}
+
+func TestMarketSellExactFill(t *testing.T) {
+	e := NewEngine()
+	mustSubmit(t, e, mkLimit(1, order.Buy, 100, 80))
+	r := mustSubmit(t, e, mkMarket(2, order.Sell, 80))
+
+	if len(r.Trades) != 1 {
+		t.Fatalf("expected 1 trade, got %d", len(r.Trades))
+	}
+	assertTrade(t, r.Trades[0], 1, 1, 2, 100, 80)
+	if r.Status != order.Filled {
+		t.Errorf("market sell status = %s, want FILLED", r.Status)
+	}
+}
+
+func TestMarketOrderInsufficientLiquidity(t *testing.T) {
+	e := NewEngine()
+	mustSubmit(t, e, mkLimit(1, order.Sell, 100, 50))
+	mustSubmit(t, e, mkLimit(2, order.Sell, 101, 30))
+
+	r := mustSubmit(t, e, mkMarket(3, order.Buy, 120))
+	if len(r.Trades) != 2 {
+		t.Fatalf("expected 2 trades, got %d", len(r.Trades))
+	}
+	assertTrade(t, r.Trades[0], 1, 3, 1, 100, 50)
+	assertTrade(t, r.Trades[1], 2, 3, 2, 101, 30)
+
+	if r.Status != order.Cancelled || r.FilledQty != 80 || r.Remaining != 40 {
+		t.Errorf("market buy = %s filled=%d remaining=%d, want CANCELLED 80/40", r.Status, r.FilledQty, r.Remaining)
+	}
+	o3 := mustGet(t, e, 3)
+	if o3.Status != order.Cancelled || o3.Filled != 80 {
+		t.Errorf("order 3 = %s filled=%d, want CANCELLED 80", o3.Status, o3.Filled)
+	}
+	// The market order must never rest, and the ask side is now empty.
+	if bids, asks := e.GetOrderBookSnapshot().Bids, e.GetOrderBookSnapshot().Asks; len(bids) != 0 || len(asks) != 0 {
+		t.Errorf("book must be empty, got bids=%d asks=%d", len(bids), len(asks))
+	}
+}
+
+func TestMarketOrderNoLiquidity(t *testing.T) {
+	e := NewEngine()
+	r := mustSubmit(t, e, mkMarket(1, order.Buy, 100))
+
+	if len(r.Trades) != 0 {
+		t.Fatalf("expected no trades, got %d", len(r.Trades))
+	}
+	if r.Status != order.Cancelled || r.FilledQty != 0 || r.Remaining != 100 {
+		t.Errorf("market buy = %s filled=%d remaining=%d, want CANCELLED 0/100", r.Status, r.FilledQty, r.Remaining)
+	}
+	if o := mustGet(t, e, 1); o.Status != order.Cancelled {
+		t.Errorf("order 1 status = %s, want CANCELLED", o.Status)
+	}
+	if e.GetOrderBookSnapshot().Bids != nil && len(e.GetOrderBookSnapshot().Bids) != 0 {
+		t.Errorf("book must be empty, got %+v", e.GetOrderBookSnapshot().Bids)
+	}
+}
+
+func TestMarketOrderPartialFillHitsRestingPrices(t *testing.T) {
+	e := NewEngine()
+	mustSubmit(t, e, mkLimit(1, order.Sell, 100, 50))
+	r := mustSubmit(t, e, mkMarket(2, order.Buy, 20))
+
+	assertTrade(t, r.Trades[0], 1, 2, 1, 100, 20)
+	sell := mustGet(t, e, 1)
+	if sell.Status != order.PartiallyFilled || sell.Filled != 20 || sell.Remaining() != 30 {
+		t.Errorf("resting sell = %s filled=%d remaining=%d, want PARTIAL 20/30", sell.Status, sell.Filled, sell.Remaining())
+	}
+}
+
+func TestMarketOrderWithPriceRejected(t *testing.T) {
+	e := NewEngine()
+	mkt := order.NewOrder(1, "AAPL", order.Buy, order.Market, 100, 100)
+	if _, err := e.SubmitOrder(mkt); !errors.Is(err, order.ErrMarketPriceSet) {
+		t.Errorf("SubmitOrder(market with price) err = %v, want %v", err, order.ErrMarketPriceSet)
+	}
+}
+
+func TestMarketOrderAfterLimitSweep(t *testing.T) {
+	e := NewEngine()
+	mustSubmit(t, e, mkLimit(1, order.Sell, 101, 10))
+	mustSubmit(t, e, mkLimit(2, order.Sell, 103, 20))
+	mustSubmit(t, e, mkLimit(3, order.Sell, 105, 30))
+	r := mustSubmit(t, e, mkMarket(4, order.Buy, 45))
+
+	if len(r.Trades) != 3 {
+		t.Fatalf("expected 3 trades, got %d", len(r.Trades))
+	}
+	assertTrade(t, r.Trades[0], 1, 4, 1, 101, 10)
+	assertTrade(t, r.Trades[1], 2, 4, 2, 103, 20)
+	assertTrade(t, r.Trades[2], 3, 4, 3, 105, 15)
+	if asks := e.GetOrderBookSnapshot().Asks; len(asks) != 1 || asks[0].Price != 105 || asks[0].Qty != 15 {
+		t.Errorf("asks should hold 15 @105, got %+v", asks)
 	}
 }
 
@@ -539,20 +692,47 @@ func TestBookMembershipConsistencyAfterOps(t *testing.T) {
 	}
 }
 
+// snapshotString produces a canonical representation of a book snapshot for
+// deterministic comparison. The snapshot is already best-first / FIFO.
+func snapshotString(snap book.Snapshot) string {
+	side := func(levels []book.LevelSnapshot) string {
+		parts := make([]string, 0, len(levels))
+		for _, lvl := range levels {
+			var ids []string
+			for _, o := range lvl.Orders {
+				ids = append(ids, fmt.Sprintf("%d(r%d)", o.ID, o.Remaining()))
+			}
+			parts = append(parts, fmt.Sprintf("%d={%s|%d}", lvl.Price, strings.Join(ids, ","), lvl.Qty))
+		}
+		return "[" + strings.Join(parts, " ") + "]"
+	}
+	return side(snap.Bids) + " : " + side(snap.Asks)
+}
+
+type determinismResult struct {
+	trades     []Trade
+	statuses   map[order.OrderID]order.Status
+	cancelErrs []error
+	book       string
+}
+
 func TestDeterminism(t *testing.T) {
 	orders := []order.Order{
 		mkLimit(1, order.Buy, 100, 100),
 		mkLimit(2, order.Buy, 101, 100),
-		mkLimit(3, order.Sell, 100, 150),
-		mkLimit(4, order.Sell, 102, 100),
-		mkLimit(5, order.Buy, 101, 200),
+		mkLimit(3, order.Sell, 100, 150), // fills buy2 (100) then buy1 (50); buy1 rem 50
+		mkLimit(4, order.Sell, 102, 100), // rests ask 102
+		mkMarket(5, order.Buy, 120),      // fills ask 4 (100); remaining 20 cancelled
+		mkLimit(6, order.Buy, 99, 50),    // rests bid 99
+		mkLimit(7, order.Sell, 103, 60),  // rests ask 103 (no cross: 103 > best bid 100)
+		mkMarket(8, order.Sell, 40),      // fills buy1 (40 of 50)
 	}
 	fixed := time.Unix(1000, 0)
 	for i := range orders {
 		orders[i].Time = fixed.Add(time.Duration(i) * time.Second)
 	}
 
-	run := func() ([]Trade, map[order.OrderID]order.Status) {
+	run := func() determinismResult {
 		e := NewEngine()
 		var trades []Trade
 		for _, o := range orders {
@@ -562,30 +742,203 @@ func TestDeterminism(t *testing.T) {
 			}
 			trades = append(trades, res.Trades...)
 		}
+		cancelErrs := []error{
+			e.CancelOrder(6), // resting → nil
+			e.CancelOrder(3), // filled → ErrAlreadyFilled
+		}
 		statuses := make(map[order.OrderID]order.Status)
-		for _, o := range orders {
-			statuses[o.ID] = mustGet(t, e, o.ID).Status
+		for id := range orders {
+			oid := order.OrderID(id + 1)
+			statuses[oid] = mustGet(t, e, oid).Status
 		}
-		return trades, statuses
+		return determinismResult{
+			trades:     trades,
+			statuses:   statuses,
+			cancelErrs: cancelErrs,
+			book:       snapshotString(e.GetOrderBookSnapshot()),
+		}
 	}
 
-	t1, s1 := run()
-	t2, s2 := run()
+	r1 := run()
+	r2 := run()
 
-	if len(t1) != len(t2) {
-		t.Fatalf("trade count differs between runs: %d vs %d", len(t1), len(t2))
-	}
-	for i := range t1 {
-		if t1[i] != t2[i] {
-			t.Errorf("trade %d differs between runs:\n run1: %+v\n run2: %+v", i, t1[i], t2[i])
-		}
-	}
-	for id, st := range s1 {
-		if s2[id] != st {
-			t.Errorf("order %d status differs between runs: %s vs %s", id, st, s2[id])
-		}
-	}
-	if len(t1) == 0 {
+	if len(r1.trades) == 0 {
 		t.Fatal("test scenario produced no trades")
+	}
+	if len(r1.trades) != len(r2.trades) {
+		t.Fatalf("trade count differs: %d vs %d", len(r1.trades), len(r2.trades))
+	}
+	for i := range r1.trades {
+		if r1.trades[i] != r2.trades[i] {
+			t.Errorf("trade %d differs:\n  run1: %+v\n  run2: %+v", i, r1.trades[i], r2.trades[i])
+		}
+	}
+	for id, st := range r1.statuses {
+		if r2.statuses[id] != st {
+			t.Errorf("order %d status differs: %s vs %s", id, st, r2.statuses[id])
+		}
+	}
+	for i := range r1.cancelErrs {
+		if (r1.cancelErrs[i] == nil) != (r2.cancelErrs[i] == nil) {
+			t.Errorf("cancel %d result differs: %v vs %v", i, r1.cancelErrs[i], r2.cancelErrs[i])
+		}
+	}
+	if r1.book != r2.book {
+		t.Errorf("final book differs:\n  run1: %s\n  run2: %s", r1.book, r2.book)
+	}
+}
+
+// --- API & result-model tests ---
+
+func TestSubmitResultFields(t *testing.T) {
+	e := NewEngine()
+	r := mustSubmit(t, e, mkLimit(1, order.Buy, 100, 100))
+	if r.OrderID != 1 || r.OriginalQty != 100 || r.FilledQty != 0 || r.Remaining != 100 || r.Status != order.Open {
+		t.Errorf("resting result = %+v", r)
+	}
+	if len(r.Trades) != 0 {
+		t.Errorf("resting should have 0 trades, got %d", len(r.Trades))
+	}
+
+	r2 := mustSubmit(t, e, mkLimit(2, order.Sell, 100, 40))
+	if r2.OrderID != 2 || r2.OriginalQty != 40 || r2.FilledQty != 40 || r2.Remaining != 0 || r2.Status != order.Filled {
+		t.Errorf("fill result = %+v", r2)
+	}
+	if len(r2.Trades) != 1 {
+		t.Errorf("fill result should have 1 trade, got %d", len(r2.Trades))
+	}
+}
+
+func TestGetOrderReturnsCopy(t *testing.T) {
+	e := NewEngine()
+	mustSubmit(t, e, mkLimit(1, order.Buy, 100, 100))
+
+	o, err := e.GetOrder(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.Filled = 999
+	o.Status = order.Filled
+	o.Price = 0
+
+	got, err := e.GetOrder(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Filled != 0 || got.Status != order.Open || got.Price != 100 {
+		t.Errorf("mutating GetOrder copy leaked into engine: %+v", got)
+	}
+	if lvl := e.GetOrderBookSnapshot().Bids; len(lvl) != 1 || lvl[0].Qty != 100 {
+		t.Errorf("book also affected: %+v", lvl)
+	}
+}
+
+func TestGetOrderNotFound(t *testing.T) {
+	e := NewEngine()
+	if _, err := e.GetOrder(99); !errors.Is(err, ErrOrderNotFound) {
+		t.Errorf("GetOrder(99) err = %v, want %v", err, ErrOrderNotFound)
+	}
+}
+
+func TestSnapshotIsImmutable(t *testing.T) {
+	e := NewEngine()
+	mustSubmit(t, e, mkLimit(1, order.Buy, 100, 50))
+	mustSubmit(t, e, mkLimit(2, order.Buy, 100, 50))
+
+	snap := e.GetOrderBookSnapshot()
+	// Mutate every snapshot-level copy.
+	for lvlIdx := range snap.Bids {
+		lvl := &snap.Bids[lvlIdx]
+		lvl.Price = 1
+		lvl.Qty = 1
+		for _, o := range lvl.Orders {
+			o.ID = 999
+			o.Qty = 1
+			o.Filled = 1
+		}
+	}
+	snap.Asks = append(snap.Asks, book.LevelSnapshot{Price: 1, Qty: 1})
+
+	// Fresh snapshot must be unaffected.
+	again := e.GetOrderBookSnapshot()
+	if len(again.Bids) != 1 {
+		t.Fatalf("bid levels = %d, want 1", len(again.Bids))
+	}
+	lvl := again.Bids[0]
+	if lvl.Price != 100 || lvl.Qty != 100 {
+		t.Errorf("bid level = price=%d qty=%d, want 100/100", lvl.Price, lvl.Qty)
+	}
+	if len(lvl.Orders) != 2 || lvl.Orders[0].ID != 1 || lvl.Orders[1].ID != 2 {
+		t.Errorf("bid orders = %+v, want IDs 1,2", lvl.Orders)
+	}
+	if len(again.Asks) != 0 {
+		t.Errorf("ask side should be empty, got %+v", again.Asks)
+	}
+}
+
+func TestTradeResultIsValueCopy(t *testing.T) {
+	e := NewEngine()
+	mustSubmit(t, e, mkLimit(1, order.Sell, 100, 100))
+	r := mustSubmit(t, e, mkLimit(2, order.Buy, 101, 50))
+
+	// Mutate the returned trade copy.
+	r.Trades[0].Qty = 1
+	r.Trades[0].Price = 0
+
+	sell := mustGet(t, e, 1)
+	if sell.Filled != 50 || sell.Remaining() != 50 {
+		t.Errorf("mutating returned trade leaked into engine: filled=%d remaining=%d", sell.Filled, sell.Remaining())
+	}
+}
+
+// --- Invariant & CheckInvariants tests ---
+
+func TestCheckInvariantsClean(t *testing.T) {
+	e := NewEngine()
+	runRichScenario(t, e)
+	// Exercise a market order too (insufficient liquidity path).
+	mustSubmit(t, e, mkMarket(8, order.Buy, 500))
+
+	if err := e.CheckInvariants(); err != nil {
+		t.Fatalf("invariants violated: %v", err)
+	}
+}
+
+func TestCheckInvariantsDetectsFilledOvercount(t *testing.T) {
+	e := NewEngine()
+	mustSubmit(t, e, mkLimit(1, order.Buy, 100, 100))
+	e.orders[1].Filled = e.orders[1].Qty + 1
+	if err := e.CheckInvariants(); err == nil {
+		t.Error("expected filled>original to be detected")
+	}
+}
+
+func TestCheckInvariantsDetectsTerminalInBook(t *testing.T) {
+	e := NewEngine()
+	mustSubmit(t, e, mkLimit(1, order.Buy, 100, 50))
+	e.orders[1].Status = order.Filled
+	if err := e.CheckInvariants(); err == nil {
+		t.Error("expected terminal-order-in-book to be detected")
+	}
+}
+
+func TestCheckInvariantsDetectsActiveNotInBook(t *testing.T) {
+	e := NewEngine()
+	mustSubmit(t, e, mkLimit(1, order.Buy, 100, 50))
+	e.orders[1].Status = order.Open
+	// Remove from book directly via engine internals (white-box test).
+	e.book.Remove(1)
+	if err := e.CheckInvariants(); err == nil {
+		t.Error("expected active-order-not-in-book to be detected")
+	}
+}
+
+func TestBookStructuralInvariantsAfterRichScenario(t *testing.T) {
+	e := NewEngine()
+	runRichScenario(t, e)
+	mustSubmit(t, e, mkMarket(8, order.Sell, 200)) // sweeps bids
+	mustCancel(t, e, 5)                            // resting ask @102
+	if err := e.book.CheckInvariants(); err != nil {
+		t.Fatalf("book invariants violated: %v", err)
 	}
 }
