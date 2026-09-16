@@ -109,3 +109,14 @@ Operations: `Add` (rejects wrong-price orders with `ErrWrongPrice`), `Front`,
 
 Prices use the integer representation established in the order domain
 (₹100.25 → `10025`); no floating-point values appear anywhere.
+
+## Ordering price levels across the book
+
+The queue orders orders *within* one price; ordering *between* prices is a
+Step 4 concern and lives in the order book. It was originally a sorted linked
+list (`container/list`), walked linearly on new-price insertion — O(P) with
+pointer chasing, which the V1 benchmark measured as ~270× slower than
+inserting onto an existing price. It is now a `[]order.Price` kept sorted
+best-first with a binary search (`sort.Search`) plus an in-place `memmove`
+shift. See the [order book](./order-book.md) document for the full
+investigation, complexity table, and benchmark comparison.

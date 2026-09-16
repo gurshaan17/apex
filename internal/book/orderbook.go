@@ -1,8 +1,8 @@
 package book
 
 import (
-	"container/list"
 	"errors"
+	"sort"
 
 	"github.com/gurshaan17/apex/internal/order"
 )
@@ -27,58 +27,63 @@ type orderLocation struct {
 }
 
 // bookSide holds every price level on one side of the book (bids or asks)
-// plus the sorted list of prices used to answer BestBid/BestAsk.
+// plus the sorted slice of prices used to answer BestBid/BestAsk. The slice
+// is kept best-first so best() is a plain index read: bids descending, asks
+// ascending. better must be a strict total order, which is what makes the
+// binary search in insertPrice/removePrice valid.
 type bookSide struct {
 	levels map[order.Price]*PriceLevel
-	prices *list.List                    // sorted by priority: best price first
-	elems  map[order.Price]*list.Element // price → its list element
-	better func(a, b order.Price) bool   // true if a has higher priority than b
+	prices []order.Price               // sorted by priority: best price first
+	better func(a, b order.Price) bool // true if a has higher priority than b
 }
 
 func newBookSide(better func(a, b order.Price) bool) *bookSide {
 	return &bookSide{
 		levels: make(map[order.Price]*PriceLevel),
-		prices: list.New(),
-		elems:  make(map[order.Price]*list.Element),
+		prices: make([]order.Price, 0, 16),
 		better: better,
 	}
 }
 
 // best returns the best price on the side, or 0 if the side is empty.
 func (s *bookSide) best() order.Price {
-	if e := s.prices.Front(); e != nil {
-		return e.Value.(order.Price)
+	if len(s.prices) == 0 {
+		return 0
 	}
-	return 0
+	return s.prices[0]
+}
+
+// priceIndex returns the position where price belongs in the sorted prices
+// slice. It is found with binary search rather than a scan: the better
+// predicate must be a strict total order, which makes the search range
+// monotonic. Returns the insertion point when price is not present.
+func (s *bookSide) priceIndex(price order.Price) int {
+	return sort.Search(len(s.prices), func(i int) bool {
+		return s.better(price, s.prices[i])
+	})
 }
 
 // insertPrice inserts a new price level, keeping the side sorted by priority.
+// The price must not already be present, so insertPrice is always called after
+// a failed levelAt lookup.
 func (s *bookSide) insertPrice(price order.Price, pl *PriceLevel) {
-	if _, ok := s.levels[price]; ok {
-		return
-	}
 	s.levels[price] = pl
-	var elem *list.Element
-	for e := s.prices.Front(); e != nil; e = e.Next() {
-		p := e.Value.(order.Price)
-		if s.better(price, p) {
-			elem = s.prices.InsertBefore(price, e)
-			break
-		}
-	}
-	if elem == nil {
-		elem = s.prices.PushBack(price)
-	}
-	s.elems[price] = elem
+	i := s.priceIndex(price)
+	s.prices = append(s.prices, 0)
+	copy(s.prices[i+1:], s.prices[i:])
+	s.prices[i] = price
 }
 
 // removePrice drops a price level from the side entirely.
 func (s *bookSide) removePrice(price order.Price) {
-	if el, ok := s.elems[price]; ok {
-		s.prices.Remove(el)
-		delete(s.elems, price)
-	}
 	delete(s.levels, price)
+	i := sort.Search(len(s.prices), func(i int) bool {
+		return !s.better(s.prices[i], price)
+	})
+	if i < len(s.prices) && s.prices[i] == price {
+		copy(s.prices[i:], s.prices[i+1:])
+		s.prices = s.prices[:len(s.prices)-1]
+	}
 }
 
 // levelAt returns the price level for the given price, if present.
@@ -196,9 +201,8 @@ func (ob *OrderBook) Snapshot() Snapshot {
 }
 
 func (ob *OrderBook) sideSnapshot(s *bookSide) []LevelSnapshot {
-	out := make([]LevelSnapshot, 0, s.prices.Len())
-	for e := s.prices.Front(); e != nil; e = e.Next() {
-		price := e.Value.(order.Price)
+	out := make([]LevelSnapshot, 0, len(s.prices))
+	for _, price := range s.prices {
 		pl, _ := s.levelAt(price)
 		var qty order.Quantity
 		orders := make([]*order.Order, 0, pl.Len())

@@ -58,20 +58,16 @@ func (ob *OrderBook) checkInvariants() error {
 }
 
 func (ob *OrderBook) checkSideInvariants(s *bookSide, side order.Side) error {
-	if len(s.levels) != s.prices.Len() || len(s.levels) != len(s.elems) {
-		return fmt.Errorf("level map, price list and element map disagree (%d/%d/%d)",
-			len(s.levels), s.prices.Len(), len(s.elems))
+	if len(s.levels) != len(s.prices) {
+		return fmt.Errorf("level map and price slice disagree (%d/%d)",
+			len(s.levels), len(s.prices))
 	}
-	var prev order.Price
-	havePrev := false
-	for e := s.prices.Front(); e != nil; e = e.Next() {
-		price := e.Value.(order.Price)
-		if havePrev && !s.better(prev, price) {
-			return fmt.Errorf("price list out of order: %d before %d", prev, price)
+	for i := 0; i+1 < len(s.prices); i++ {
+		if !s.better(s.prices[i], s.prices[i+1]) {
+			return fmt.Errorf("price slice out of order: %d before %d", s.prices[i], s.prices[i+1])
 		}
-		prev = price
-		havePrev = true
-
+	}
+	for _, price := range s.prices {
 		pl, ok := s.levelAt(price)
 		if !ok {
 			return fmt.Errorf("price list contains %d with no level", price)
