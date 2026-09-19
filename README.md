@@ -11,13 +11,17 @@ distribution.
 
 ## Current Status
 
-**V1 - Steps 8–10: Market Orders, Engine API & Result Model, Determinism & Invariants**
+**V1 - Steps 8–12: Market Orders, Engine API & Result Model, Determinism, Benchmarks & Profiling**
 
-The matching engine now supports both limit and market orders with price-time
-priority, partial fills, and cancellation. The public API is small and
-immutable-safe (callers never touch internal structures), and correctness is
-backed by invariant and determinism guarantees. Transport, concurrency,
-persistence, risk, clearing, and market data remain future phases.
+The matching engine supports both limit and market orders with price-time
+priority, partial fills, and cancellation behind a small, immutable-safe
+public API (callers never touch internal structures), with correctness backed
+by invariant and determinism guarantees. V1 closes with a benchmark suite and
+a measured performance pass: new price-level insertion was optimized from an
+O(P) linked-list scan to a binary-search + in-place shift (~130–185x faster,
+documented in [docs/order-book.md](docs/order-book.md)). Transport,
+concurrency, persistence, risk, clearing, and market data remain future
+phases.
 
 ## Order Structure
 
@@ -41,8 +45,8 @@ An order carries the fields required by the future matching engine:
   ₹100.25 → `10025` paise). This avoids floating-point precision problems.
 - **Quantity** — integer units only; no fractional quantities in this phase.
 - **Sides** — typed enum (`Buy`/`Sell`), never raw strings.
-- **Types** — typed enum (`Limit`/`Market`). Market-order **matching** is a
-  later phase; the type exists now as part of the domain model.
+- **Types** — typed enum (`Limit`/`Market`). Market orders carry no price and
+  are matched against the best opposite-side liquidity by the engine.
 - **Statuses** — typed enum: `New`, `Open`, `PartiallyFilled`, `Filled`,
   `Cancelled`.
 
@@ -192,16 +196,20 @@ asks ascending, FIFO within each price.
 
 Key points:
 
-- **Best bid/ask** — O(1) via the front of each side's sorted price list.
+- **Best bid/ask** — O(1) via `prices[0]` of each side's sorted price slice
+  (bids descending, asks ascending).
 - **Order lookup/removal** — an `OrderID → {side, price, node}` index makes
-  `Get`, `Remove`, and future cancellation O(1) without scanning.
+  `Get`, `Remove`, and cancellation O(1) without scanning.
 - **Empty levels removed** — when the last order at a price is removed, the
   price level disappears, so best prices always reflect populated levels.
+- **New price-level insert** — O(log P) binary search plus an in-place shift
+  (P = distinct prices); the original O(P) linked-list scan is gone.
 - **Snapshot** — `Snapshot()` returns a read-only, best-first view with price,
   total quantity, and FIFO orders per level; snapshot orders are copies.
-- **Market orders rejected** — a market order has no resting price; execution
-  is a later phase.
-- **Crossed books allowed** — matching is a later phase (Step 5).
+- **Market orders never rest** — the book rejects them (they have no resting
+  price); the engine consumes opposite-side liquidity directly instead.
+- **Crossed books allowed at the book layer** — the book does not match;
+  crossing orders are resolved by the engine.
 
 Full details: [docs/order-book.md](docs/order-book.md).
 
@@ -308,8 +316,8 @@ Full details: [docs/matching-engine.md](docs/matching-engine.md).
 | 08 | Market Orders            | ✓ Done (Step 8)            |
 | 09 | Engine API & Result Model| ✓ Done (Step 9)            |
 | 10 | Determinism & Invariants | ✓ Done (Step 10)           |
-| 11 | Benchmarks               | Planned                    |
-| 12 | Profiling + Optimization | Planned                    |
+| 11 | Benchmarks               | ✓ Done (Step 11)           |
+| 12 | Profiling + Optimization | ✓ Done (Step 12)           |
 
 ## Development Commands
 
